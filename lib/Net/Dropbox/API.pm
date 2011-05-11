@@ -6,6 +6,8 @@ use JSON;
 use Mouse;
 use Net::OAuth;
 use LWP::UserAgent;
+use URI;
+use HTTP::Status qw(:constants);
 use HTTP::Request::Common;
 use Data::Random qw(rand_chars);
 use Encode;
@@ -16,11 +18,11 @@ Net::Dropbox::API - A dropbox API interface
 
 =head1 VERSION
 
-Version 1.2.1
+Version 1.5.4.3
 
 =cut
 
-our $VERSION = '1.2';
+our $VERSION = '1.5';
 
 
 =head1 SYNOPSIS
@@ -32,12 +34,14 @@ This is how it works:
     use Net::Dropbox::API;
 
     my $box = Net::Dropbox::API->new({key => 'KEY', secret => 'SECRET'});
-    my $login_link = $box->login;  # user needs to klick this link and login
+    my $login_link = $box->login;  # user needs to click this link and login
     $box->auth;                    # oauth keys get exchanged
     my $info = $box->account_info; # and here we have our account info
 
 See the examples for a working Mojolicious web client using the Dropbox
 API.
+
+You can find Dropbox's API documentation at L<https://www.dropbox.com/developers/web_docs>
 
 =head1 FUNCTIONS
 
@@ -59,7 +63,7 @@ has 'context' => (is => 'rw', isa => 'Str', default => 'sandbox');
 =head2 login
 
 This sets up the initial OAuth handshake and returns the login URL. This
-URL has to be clicked by the user and the the user then has to accept
+URL has to be clicked by the user and the user then has to accept
 the application in dropbox. 
 
 Dropbox then redirects back to the callback URL defined with
@@ -76,7 +80,7 @@ sub login {
     my $request = Net::OAuth->request("request token")->new(
         consumer_key => $self->key,
         consumer_secret => $self->secret,
-        request_url => 'http://api.dropbox.com/0/oauth/request_token',
+        request_url => 'https://api.dropbox.com/0/oauth/request_token',
         request_method => 'POST',
         signature_method => 'HMAC-SHA1',
         timestamp => time,
@@ -117,7 +121,7 @@ sub auth {
     my $request = Net::OAuth->request("access token")->new(
         consumer_key => $self->key,
         consumer_secret => $self->secret,
-        request_url => 'http://api.dropbox.com/0/oauth/access_token',
+        request_url => 'https://api.dropbox.com/0/oauth/access_token',
         request_method => 'POST',
         signature_method => 'HMAC-SHA1',
         timestamp => time,
@@ -157,15 +161,64 @@ sub account_info {
 
 =head2 list
 
-lists all files in the path defined.
+lists all files in the path defined:
+
+    $data = $box->list();           # top-level
+    $data = $box->list( "/Photos" ); # folder
+
+The data returned is a ref to a hash containing various fields returned
+by Dropbox, including a C<hash> value, which can be used later to check
+if Dropbox data beneath a specified folder has changed since the last call.
+
+For this, C<list()> accepts an optional 'hash' argument:
+
+    $data = $box->list({ hash => "ce9ccbfb8f255f234c93adcfef33b5a6" },
+                       "/Photos");
+
+This will either return
+
+    { http_response_code => 304 }
+
+in which case nothing has changed since the last call, or 
+
+    { http_response_code => 200,
+      # ... various other fields
+    }
+
+if there were modifications.
 
 =cut
 
 sub list {
     my $self = shift;
+    my $opts = {};
+    if(defined $_[0]  and ref($_[0]) eq "HASH") {
+          # optional option hash present
+        $opts = shift;
+    }
     my $path = shift || '';
 
-    return from_json($self->_talk('files/'.$self->context.'/'.$path));
+    my $uri = URI->new('files/'.$self->context.$path);
+    $uri->query_form($opts) if scalar keys %$opts;
+
+    my $talk_opts = {};
+
+    if(exists $opts->{hash}) {
+       $talk_opts = {
+           error_handler => sub {
+               my $obj   = shift;
+               my $resp  = shift;
+               if( $resp->code == HTTP_NOT_MODIFIED ) {
+                   return to_json({ http_response_code => 
+                                    HTTP_NOT_MODIFIED });
+               } else {
+                   return $self->_talk_default_error_handler($resp);
+               }
+           },
+       };
+    }
+
+    return from_json($self->_talk($talk_opts, $uri->as_string));
 }
 
 =head2 copy
@@ -296,6 +349,13 @@ get a file from dropbox
 
 =cut
 
+=head2 debug
+
+Set this to a non-false value in order to print some debugging information to STDOUT.
+    debug(1)
+
+=cut
+
 sub getfile {
     my $self = shift;
     my $path = shift || '';
@@ -324,6 +384,11 @@ sub nonce { join( '', rand_chars( size => 16, set => 'alphanumeric' )); }
 
 sub _talk {
     my $self    = shift;
+    my $opts    = {};
+    if(defined $_[0]  and ref($_[0]) eq "HASH") {
+          # optional option hash present
+        $opts = shift;
+    }
     my $command = shift;
     my $method  = shift || 'GET';
     my $content = shift;
@@ -332,12 +397,16 @@ sub _talk {
     my $content_file = shift;
     my $extra_params = shift;
 
+    if( !defined $opts->{error_handler} ) {
+        $opts->{error_handler} = \&_talk_default_error_handler;
+    }
+
     my $ua = LWP::UserAgent->new;
 
     my %opts = (
         consumer_key => $self->key,
         consumer_secret => $self->secret,
-        request_url => 'http://'.$api.'.dropbox.com/0/'.$command,
+        request_url => 'https://'.$api.'.dropbox.com/0/'.$command,
         request_method => $method,
         signature_method => 'HMAC-SHA1',
         timestamp => time,
@@ -366,18 +435,33 @@ sub _talk {
 
     if ($res->is_success) {
         print "Got Content ", $res->content, "\n" if $self->debug;
-        return $res->content;
-    }
-    else {
+        my $data;
+        eval {
+            $data = from_json($res->content);
+        };
+        if($@) {
+            # got invalid json from server
+            return to_json({ error => "Invalid JSON server response",
+                             http_response_code => $res->code(),
+                           });
+        }
+        $data->{http_response_code} = $res->code();
+        return to_json($data);
+    } else {
         $self->error($res->status_line);
-        warn "Something went wrong: ".$res->status_line;
+        return $opts->{error_handler}->($self, $res);
     }
     return;
 }
 
-=head2 talk
+sub _talk_default_error_handler {
+    my $self    = shift;
+    my $res     = shift;
 
-=cut
+    warn "Something went wrong: ".$res->status_line;
+    return to_json({error => $res->status_line,
+                    http_response_code => $res->code});
+}
 
 =head1 AUTHOR
 
@@ -391,10 +475,12 @@ Chris Prather C<< chris at prather.org >>
 
 Shinichiro Aska
 
+[ktdreyer]
+
 =head1 BUGS
 
-Please report any bugs or feature requests to C<bug-net-dropbox-api at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Net-Dropbox-API>.  I will be notified, and then you'll
+Please report any bugs through the web interface at
+L<https://github.com/norbu09/Net--Dropbox/issues>.  I will be notified, and then you'll
 automatically be notified of progress on your bug as I make changes.
 
 =head1 SUPPORT
@@ -406,10 +492,6 @@ You can find documentation for this module with the perldoc command.
 You can also look for information at:
 
 =over 4
-
-=item * RT: CPAN's request tracker
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Net-Dropbox-API>
 
 =item * AnnoCPAN: Annotated CPAN documentation
 
